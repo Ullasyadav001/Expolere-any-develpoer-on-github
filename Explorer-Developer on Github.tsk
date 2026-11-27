@@ -1,0 +1,243 @@
+import { useMemo, useState } from "react";
+import { createFileRoute } from "@tanstack/react-router";
+import { useQuery } from "@tanstack/react-query";
+import { AlertTriangle, Clock, SearchX, Telescope } from "lucide-react";
+import { Navbar } from "@/components/explorer/Navbar";
+import { SearchBar } from "@/components/explorer/SearchBar";
+import { ProfileCard } from "@/components/explorer/ProfileCard";
+import { LanguageBar } from "@/components/explorer/LanguageBar";
+import { RepoFilters } from "@/components/explorer/RepoFilters";
+import { RepoGrid, RepoGridSkeleton } from "@/components/explorer/RepoGrid";
+import { SavedDrawer } from "@/components/explorer/SavedDrawer";
+import { AuthDialog } from "@/components/explorer/AuthDialog";
+import { authError, useAuth } from "@/hooks/use-auth";
+import { useSaved } from "@/hooks/use-saved";
+import { useTheme } from "@/hooks/use-theme";
+import {
+  GitHubError,
+  fetchRepos,
+  fetchUser,
+  filterAndSortRepos,
+  languageBreakdown,
+  type SortKey,
+} from "@/lib/github";
+
+type Search = { user?: string; lang?: string; sort?: SortKey; q?: string };
+
+export const Route = createFileRoute("/")({
+  validateSearch: (s: Record<string, unknown>): Search => {
+    const out: Search = {};
+    for (const k of ["user", "lang", "q"] as const) {
+      const v = s[k];
+      if (typeof v === "string" && v) out[k] = v;
+    }
+    const sort = s["sort"];
+    if (sort === "stars" || sort === "forks") out.sort = sort;
+    return out;
+  },
+  head: () => ({
+    meta: [
+      { title: "GitHub Explorer — Developer & Repository Search" },
+      { name: "description", content: "Search any GitHub developer, browse their repos, languages and stats, and bookmark favorites." },
+      { property: "og:title", content: "GitHub Explorer — Developer & Repository Search" },
+      { property: "og:description", content: "Search any GitHub developer, browse their repos, languages and stats." },
+      { property: "og:type", content: "website" },
+      { name: "twitter:card", content: "summary_large_image" },
+    ],
+  }),
+  component: Index,
+});
+
+function Index() {
+  const raw = Route.useSearch();
+  const search = { user: raw.user ?? "", lang: raw.lang ?? "", sort: raw.sort ?? ("updated" as SortKey), q: raw.q ?? "" };
+  const navigate = Route.useNavigate();
+  const { theme, toggle } = useTheme();
+  const auth = useAuth();
+  const { saved, isSaved, toggle: toggleSave, remove, loading: savedLoading, pending: saving, error: savedError } = useSaved(auth.user, auth.loading);
+  const [drawer, setDrawer] = useState(false);
+  const [authOpen, setAuthOpen] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
+  const accountError = signOutError ?? savedError;
+  async function handleSignOut() {
+    setSigningOut(true);
+    setSignOutError(null);
+    setDrawer(false);
+    try { await auth.signOut(); }
+    catch (err) { setSignOutError(authError(err)); }
+    finally { setSigningOut(false); }
+  }
+  const username = search.user.trim();
+
+  const userQ = useQuery({
+    queryKey: ["gh-user", username.toLowerCase()],
+    queryFn: () => fetchUser(username),
+    enabled: !!username,
+    retry: false,
+    staleTime: 5 * 60_000,
+  });
+  const reposQ = useQuery({
+    queryKey: ["gh-repos", username.toLowerCase()],
+    queryFn: () => fetchRepos(username),
+    enabled: !!username && userQ.isSuccess,
+    retry: false,
+    staleTime: 5 * 60_000,
+  });
+
+  const repos = reposQ.data ?? [];
+  const shares = useMemo(() => languageBreakdown(repos), [repos]);
+  const languages = useMemo(() => shares.map((s) => s.language).sort(), [shares]);
+  const visible = useMemo(
+    () => filterAndSortRepos(repos, { language: search.lang, query: search.q, sort: search.sort }),
+    [repos, search.lang, search.q, search.sort],
+  );
+
+  const goUser = (u: string) => {
+    setDrawer(false);
+    navigate({ search: { user: u } });
+  };
+
+  const error = (userQ.error ?? reposQ.error) as GitHubError | Error | null;
+
+  return (
+    <div className="min-h-screen bg-background text-foreground">
+      <Navbar theme={theme} onToggleTheme={toggle} savedCount={saved.length} onOpenSaved={() => setDrawer(true)} signedIn={Boolean(auth.user)} accountName={auth.displayName || auth.user?.email || ""} authLoading={auth.loading} signingOut={signingOut} onSignIn={() => setAuthOpen(true)} onSignOut={() => void handleSignOut()} />
+      <main className="mx-auto max-w-6xl px-4 pb-20">
+        {accountError && <p role="alert" className="mt-4 rounded-md border border-destructive/40 p-3 text-sm text-destructive">{accountError}</p>}
+        <section className="py-10 sm:py-14">
+          <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
+            Explore any developer on <span className="text-primary">GitHub</span>
+          </h1>
+          <p className="mt-2 max-w-xl text-muted-foreground">
+             Profiles, repositories, and language stats — straight from GitHub.
+          </p>
+          <div className="mt-6 max-w-2xl">
+            <SearchBar value={username} loading={userQ.isFetching || reposQ.isFetching} onSearch={goUser} />
+          </div>
+        </section>
+
+        {!username && <EmptyHero />}
+        {username && error && <ErrorState error={error} username={username} />}
+        {username && userQ.isPending && !error && <ProfileSkeleton />}
+
+        {userQ.data && !error && (
+          <div className="space-y-6">
+            <ProfileCard
+              user={userQ.data}
+              saved={isSaved(userQ.data.login)}
+              saveDisabled={savedLoading || saving || signingOut || Boolean(savedError)}
+              onToggleSave={() => {
+                if (savedLoading || saving || signingOut || savedError) return;
+                const u = userQ.data;
+                toggleSave({ login: u.login, name: u.name, avatar_url: u.avatar_url });
+              }}
+            />
+            {reposQ.isPending ? (
+              <>
+                <div className="h-24 animate-pulse rounded-xl border border-border bg-card" />
+                <RepoGridSkeleton />
+              </>
+            ) : (
+              <>
+                <LanguageBar shares={shares} />
+                <section className="space-y-4">
+                  <div className="flex items-baseline justify-between gap-2">
+                    <h3 className="text-lg font-semibold">Repositories</h3>
+                    <span className="font-mono text-xs text-muted-foreground">
+                      {visible.length} / {repos.length}
+                    </span>
+                  </div>
+                  <RepoFilters
+                    languages={languages}
+                    language={search.lang}
+                    sort={search.sort}
+                    query={search.q}
+                    onChange={(n) =>
+                      navigate({
+                        search: (prev) => {
+                          const next = { ...prev };
+                          if (n.language !== undefined) { if (n.language) next.lang = n.language; else delete next.lang; }
+                          if (n.sort !== undefined) { if (n.sort !== "updated") next.sort = n.sort; else delete next.sort; }
+                          if (n.query !== undefined) { if (n.query) next.q = n.query; else delete next.q; }
+                          return next;
+                        },
+                        replace: true,
+                      })
+                    }
+                  />
+                  <RepoGrid repos={visible} />
+                </section>
+              </>
+            )}
+          </div>
+        )}
+      </main>
+      <SavedDrawer
+        open={drawer}
+        onOpenChange={setDrawer}
+        saved={saved}
+        current={username}
+        onSelect={goUser}
+        onRemove={remove}
+        loading={savedLoading}
+        pending={saving}
+        error={savedError}
+      />
+      <AuthDialog open={authOpen} onOpenChange={setAuthOpen} />
+    </div>
+  );
+}
+
+function EmptyHero() {
+  return (
+    <div className="flex flex-col items-center rounded-xl border border-dashed border-border px-6 py-16 text-center">
+      <Telescope className="size-10 text-muted-foreground" />
+      <p className="mt-3 font-medium">Search a username or pick a quick try above</p>
+      <p className="mt-1 text-sm text-muted-foreground">Save profiles to compare and switch between them fast.</p>
+    </div>
+  );
+}
+
+function ErrorState({ error, username }: { error: Error; username: string }) {
+  const kind = error instanceof GitHubError ? error.kind : "network";
+  const Icon = kind === "not_found" ? SearchX : kind === "rate_limit" ? Clock : AlertTriangle;
+  const title =
+    kind === "not_found" ? "User not found" : kind === "rate_limit" ? "Taking a short break" : "Something went wrong";
+  let body = error.message;
+  if (kind === "not_found") body = `No GitHub account matches “${username}”. Check the spelling and try again.`;
+  if (kind === "rate_limit" && error instanceof GitHubError) {
+    const when = error.resetAt
+      ? new Date(error.resetAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      : "soon";
+    body = `GitHub allows 60 requests per hour without sign-in. You can search again at ${when}.`;
+  }
+  return (
+    <div className="flex flex-col items-center rounded-xl border border-border bg-card px-6 py-14 text-center">
+      <Icon className="size-10 text-muted-foreground" />
+      <p className="mt-3 text-lg font-semibold">{title}</p>
+      <p className="mt-1 max-w-md text-sm text-muted-foreground">{body}</p>
+    </div>
+  );
+}
+
+function ProfileSkeleton() {
+  return (
+    <div className="space-y-6">
+      <div className="rounded-xl border border-border bg-card p-6">
+        <div className="flex gap-5">
+          <div className="size-24 animate-pulse rounded-full bg-secondary" />
+          <div className="flex-1 space-y-3">
+            <div className="h-6 w-48 animate-pulse rounded bg-secondary" />
+            <div className="h-4 w-24 animate-pulse rounded bg-secondary" />
+            <div className="h-4 w-full max-w-md animate-pulse rounded bg-secondary" />
+          </div>
+        </div>
+        <div className="mt-6 grid grid-cols-2 gap-2 sm:grid-cols-4">
+          {Array.from({ length: 4 }, (_, i) => <div key={i} className="h-16 animate-pulse rounded-lg bg-secondary" />)}
+        </div>
+      </div> 
+      <RepoGridSkeleton />
+    </div>
+  );
+}
